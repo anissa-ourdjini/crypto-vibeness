@@ -1,0 +1,5 @@
+hash: 35b95f7c0f63631c453220fb2a86f218
+mask: ?u?u?l?l?u?u?s
+mode: brute force
+hashcat_command: hashcat -m 0 -a 3 md5_yolo.txt ?u?u?l?l?u?u?s
+decrypted_message: TO_BE_FILLED_WITH_HASHCAT_OUTPUT
