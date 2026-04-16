@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import socket
@@ -135,7 +136,15 @@ def password_entropy_bits(password: str) -> float:
     if any(not c.isalnum() for c in password):
         alphabet += 33
     alphabet = max(alphabet, 1)
-    return len(password) * (alphabet.bit_length() - 1)
+    return len(password) * math.log2(alphabet)
+
+
+def password_strength_level(entropy_bits: float) -> str:
+    if entropy_bits < 40:
+        return "faible"
+    if entropy_bits < 60:
+        return "medium"
+    return "fort"
 
 
 def validate_password(password: str, rules: dict) -> Tuple[bool, str]:
@@ -287,7 +296,6 @@ class ChatServer:
         self.user_lockout_until: Dict[str, float] = {}
         self.ip_lockout_until: Dict[str, float] = {}
         self.tamper_next_dm = tamper_next_dm
-        self.tamper_used = False
 
     def log(self, msg: str) -> None:
         line = f"[{now_str()}] {msg}"
@@ -307,6 +315,14 @@ class ChatServer:
                 }
             )
         return payload
+
+    def assign_unique_color(self, username: str) -> str:
+        used_colors = {client.color for client in self.clients.values() if client.username != username}
+        for color in COLOR_PALETTE:
+            if color not in used_colors:
+                return color
+        # Palette exhausted: fall back to deterministic mapping.
+        return deterministic_color(username)
 
     def send_to_user(self, username: str, payload: dict) -> None:
         client = self.clients.get(username)
@@ -345,7 +361,8 @@ class ChatServer:
         if not ciphertext:
             return ciphertext_b64
         flipped = bytearray(ciphertext)
-        idx = len(flipped) // 2
+        # Flip the last byte so that, even without signature checks, CBC padding is very likely invalid.
+        idx = len(flipped) - 1
         flipped[idx] ^= 0x01
         return b64e(bytes(flipped))
 
@@ -439,11 +456,13 @@ class ChatServer:
                     return False, None, None
                 self.creds[username] = hash_password_record(password)
                 save_credentials(self.creds)
+                entropy_bits = round(password_entropy_bits(password), 2)
                 json_send(
                     conn,
                     {
                         "type": "password_strength",
-                        "entropy_bits": round(password_entropy_bits(password), 2),
+                        "entropy_bits": entropy_bits,
+                        "strength_level": password_strength_level(entropy_bits),
                     },
                 )
             self._register_auth_success(username, ip_addr)
@@ -485,7 +504,7 @@ class ChatServer:
                 return
 
             with self.lock:
-                color = deterministic_color(username)
+                color = self.assign_unique_color(username)
                 session = ClientSession(conn=conn, addr=addr, username=username, color=color, public_key=public_key)
                 self.clients[username] = session
                 self.pubkeys[username] = public_key
@@ -542,8 +561,9 @@ class ChatServer:
                             json_send(conn, {"type": "error", "message": "Wrong room password"})
                             continue
                         self.join_room(username, room_name)
+                        protected = room.protected
                     self.log(f"{username} joined room {room_name}")
-                    json_send(conn, {"type": "room_joined", "room": room_name})
+                    json_send(conn, {"type": "room_joined", "room": room_name, "protected": protected})
 
                 elif frame_type == "list_rooms":
                     json_send(conn, {"type": "rooms", "rooms": self.room_list_payload()})
@@ -635,9 +655,8 @@ class ChatServer:
                         continue
                     relay_ciphertext = frame.get("ciphertext")
                     with self.lock:
-                        if self.tamper_next_dm and not self.tamper_used:
+                        if self.tamper_next_dm:
                             relay_ciphertext = self.maybe_tamper_dm_ciphertext(relay_ciphertext)
-                            self.tamper_used = True
                             self.log(
                                 f"[LAB] tampered 1 byte in e2ee_dm ciphertext from={username} to={to_user}; "
                                 "recipient must reject signature"
@@ -685,7 +704,7 @@ class ChatServer:
         self.server_sock = sock
         self.log(f"Server listening on {self.host}:{self.port}")
         if self.tamper_next_dm:
-            self.log("[LAB] Tamper mode enabled: next relayed e2ee_dm will be altered by 1 byte.")
+            self.log("[LAB] Tamper mode enabled: every relayed e2ee_dm will be altered by 1 byte.")
         try:
             while True:
                 conn, addr = sock.accept()
@@ -704,7 +723,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tamper-next-dm",
         action="store_true",
-        help="Lab mode: alter one byte in the next relayed e2ee_dm ciphertext (for signature rejection demo).",
+        help="Lab mode: alter one byte in every relayed e2ee_dm ciphertext (for signature rejection demo).",
     )
     return parser.parse_args()
 

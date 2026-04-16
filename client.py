@@ -17,6 +17,19 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5050
 BUFFER_SIZE = 65536
 COLOR_RESET = "\033[0m"
+COLOR_DM_TAG = "\033[96m"
+COLOR_PALETTE = [
+    "\033[31m",
+    "\033[32m",
+    "\033[33m",
+    "\033[34m",
+    "\033[35m",
+    "\033[36m",
+    "\033[91m",
+    "\033[92m",
+    "\033[93m",
+    "\033[94m",
+]
 USERS_DIR = Path("users")
 REPLAY_WINDOW_SECONDS = 120
 MAX_SEEN_MESSAGE_IDS = 2048
@@ -56,6 +69,12 @@ def valid_public_key(pub: object) -> bool:
     if n.bit_length() < 512:
         return False
     return True
+
+
+def deterministic_color(username: str) -> str:
+    digest = hashlib.sha256(username.encode("utf-8")).digest()
+    idx = digest[0] % len(COLOR_PALETTE)
+    return COLOR_PALETTE[idx]
 
 
 def json_send(conn: socket.socket, payload: dict) -> None:
@@ -253,6 +272,7 @@ class ChatClient:
         self.peer_pubkeys: Dict[str, dict] = {}
         self.session_keys: Dict[str, bytes] = {}
         self.seen_message_ids: Dict[str, float] = {}
+        self.room_protection: Dict[str, bool] = {"general": False}
         self.user_dir = USERS_DIR
 
     def safe_print(self, msg: str) -> None:
@@ -287,6 +307,11 @@ class ChatClient:
 
     def peer_keys_path(self) -> Path:
         return self.user_dir / "known_pubkeys.json"
+
+    def format_room_name(self, room: str) -> str:
+        if self.room_protection.get(room, False):
+            return f"\U0001f512 {room}"
+        return room
 
     def load_known_peer_keys(self) -> Dict[str, dict]:
         path = self.peer_keys_path()
@@ -384,7 +409,9 @@ class ChatClient:
                 raise SystemExit("Server disconnected")
             typ = auth_reply.get("type")
             if typ == "password_strength":
-                self.safe_print(f"Password entropy estimate: {auth_reply.get('entropy_bits')} bits")
+                bits = auth_reply.get("entropy_bits")
+                level = auth_reply.get("strength_level", "unknown")
+                self.safe_print(f"Password entropy estimate: {bits} bits ({level})")
                 continue
             if typ == "error":
                 raise SystemExit(auth_reply.get("message", "Authentication failed"))
@@ -399,8 +426,8 @@ class ChatClient:
                             self.peer_pubkeys[username] = pub
                 self.save_known_peer_keys()
                 rooms = auth_reply.get("rooms", [])
-                self.safe_print(f"Connected. Current room: {self.current_room}")
                 self.print_rooms(rooms)
+                self.safe_print(f"Connected. Current room: {self.format_room_name(self.current_room)}")
                 break
             raise SystemExit("Unexpected authentication response")
 
@@ -408,6 +435,11 @@ class ChatClient:
         if not rooms:
             self.safe_print("No rooms available.")
             return
+        self.room_protection = {
+            str(r.get("name", "")).strip(): bool(r.get("protected", False))
+            for r in rooms
+            if str(r.get("name", "")).strip()
+        }
         self.safe_print("Rooms:")
         for r in rooms:
             marker = "[P]" if r.get("protected") else "[ ]"
@@ -477,7 +509,12 @@ class ChatClient:
                 "signature": b64e(sig),
             },
         )
-        self.safe_print(f"[DM -> {peer}] (encrypted and signed)")
+        peer_color = deterministic_color(peer)
+        self.safe_print(
+            f"{COLOR_DM_TAG}[DM]{COLOR_RESET} "
+            f"{self.my_color}{self.username}{COLOR_RESET} -> "
+            f"{peer_color}{peer}{COLOR_RESET}: (encrypted and signed)"
+        )
 
     def handle_incoming(self) -> None:
         while not self.stop_event.is_set():
@@ -495,11 +532,14 @@ class ChatClient:
                 color = frame.get("color", "")
                 txt = frame.get("text", "")
                 room = frame.get("room", "")
-                self.safe_print(f"[{ts}] ({room}) {color}{user}{COLOR_RESET}: {txt}")
+                room_label = self.format_room_name(str(room))
+                self.safe_print(f"[{ts}] ({room_label}) {color}{user}{COLOR_RESET}: {txt}")
 
             elif typ == "room_joined":
                 self.current_room = frame.get("room", self.current_room)
-                self.safe_print(f"Switched to room: {self.current_room}")
+                if "protected" in frame:
+                    self.room_protection[self.current_room] = bool(frame.get("protected"))
+                self.safe_print(f"Switched to room: {self.format_room_name(self.current_room)}")
 
             elif typ == "rooms":
                 self.print_rooms(frame.get("rooms", []))
@@ -615,7 +655,13 @@ class ChatClient:
                     self.safe_print(f"[SECURITY] Rejected DM from {sender}: decryption failed.")
                     continue
                 ts = frame.get("timestamp", "")
-                self.safe_print(f"[{ts}] [DM {sender} -> {self.username}] {plaintext}")
+                sender_name = str(sender)
+                sender_color = deterministic_color(sender_name)
+                self.safe_print(
+                    f"[{ts}] {COLOR_DM_TAG}[DM]{COLOR_RESET} "
+                    f"{sender_color}{sender_name}{COLOR_RESET} -> "
+                    f"{self.my_color}{self.username}{COLOR_RESET}: {plaintext}"
+                )
 
             elif typ == "info":
                 self.safe_print(frame.get("message", ""))
