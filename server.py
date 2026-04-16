@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 import argparse
-import base64
-import binascii
 import datetime as dt
-import hashlib
-import hmac
 import json
-import math
 import os
 import secrets
 import socket
@@ -16,98 +11,44 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 5050
-BUFFER_SIZE = 65536
+from common import (
+    COLOR_PALETTE,
+    COLOR_RESET,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    b64d,
+    b64e,
+    deterministic_color,
+    json_recv,
+    json_send,
+    safe_b64d,
+    valid_public_key,
+)
+from security_utils import (
+    anonymize_ip,
+    hash_password_record,
+    password_entropy_bits,
+    password_strength_level,
+    validate_password,
+    valid_msg_id,
+    valid_timestamp,
+    verify_password_record,
+)
+
+# Server defaults and file paths.
 DEFAULT_ROOM = "general"
 
 CREDENTIALS_FILE = Path("this_is_safe.txt")
 PASSWORD_RULES_FILE = Path("password_rules.json")
 LOG_FILE_TEMPLATE = "log_{timestamp}.txt"
 
-PBKDF2_ALGO = "pbkdf2_sha256"
-PBKDF2_COST = 200_000
-SALT_BYTES = 16  # 128 bits
 AUTH_WINDOW_SECONDS = 300
 AUTH_MAX_ATTEMPTS = 5
 AUTH_LOCKOUT_BASE_SECONDS = 10
 AUTH_LOCKOUT_MAX_SECONDS = 300
 
-COLOR_PALETTE = [
-    "\033[31m",
-    "\033[32m",
-    "\033[33m",
-    "\033[34m",
-    "\033[35m",
-    "\033[36m",
-    "\033[91m",
-    "\033[92m",
-    "\033[93m",
-    "\033[94m",
-]
-COLOR_RESET = "\033[0m"
-
-
 def now_str() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def b64e(data: bytes) -> str:
-    return base64.b64encode(data).decode("ascii")
-
-
-def b64d(data: str) -> bytes:
-    return base64.b64decode(data.encode("ascii"))
-
-
-def safe_b64d(data: str) -> Optional[bytes]:
-    try:
-        return b64d(data)
-    except (binascii.Error, UnicodeEncodeError, ValueError):
-        return None
-
-
-def valid_public_key(pub: object) -> bool:
-    if not isinstance(pub, dict):
-        return False
-    if "n" not in pub or "e" not in pub:
-        return False
-    try:
-        n = int(pub["n"])
-        e = int(pub["e"])
-    except (TypeError, ValueError):
-        return False
-    if n <= 0 or e <= 2:
-        return False
-    if e % 2 == 0:
-        return False
-    if n <= e:
-        return False
-    if n.bit_length() < 512:
-        return False
-    return True
-
-
-def valid_msg_id(msg_id: object) -> bool:
-    if not isinstance(msg_id, str):
-        return False
-    if len(msg_id) != 32:
-        return False
-    return all(c in "0123456789abcdef" for c in msg_id)
-
-
-def valid_timestamp(value: object) -> bool:
-    try:
-        int(value)
-    except (TypeError, ValueError):
-        return False
-    return True
-
-
-def deterministic_color(username: str) -> str:
-    digest = hashlib.sha256(username.encode("utf-8")).digest()
-    idx = digest[0] % len(COLOR_PALETTE)
-    return COLOR_PALETTE[idx]
 
 
 def load_password_rules() -> dict:
@@ -121,75 +62,6 @@ def load_password_rules() -> dict:
         }
     with PASSWORD_RULES_FILE.open("r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def password_entropy_bits(password: str) -> float:
-    if not password:
-        return 0.0
-    alphabet = 0
-    if any(c.islower() for c in password):
-        alphabet += 26
-    if any(c.isupper() for c in password):
-        alphabet += 26
-    if any(c.isdigit() for c in password):
-        alphabet += 10
-    if any(not c.isalnum() for c in password):
-        alphabet += 33
-    alphabet = max(alphabet, 1)
-    return len(password) * math.log2(alphabet)
-
-
-def password_strength_level(entropy_bits: float) -> str:
-    if entropy_bits < 40:
-        return "faible"
-    if entropy_bits < 60:
-        return "medium"
-    return "fort"
-
-
-def validate_password(password: str, rules: dict) -> Tuple[bool, str]:
-    if len(password) < int(rules.get("min_length", 0)):
-        return False, f"Password must be at least {rules.get('min_length')} chars"
-    if rules.get("require_uppercase", False) and not any(c.isupper() for c in password):
-        return False, "Password must include an uppercase letter"
-    if rules.get("require_lowercase", False) and not any(c.islower() for c in password):
-        return False, "Password must include a lowercase letter"
-    if rules.get("require_digit", False) and not any(c.isdigit() for c in password):
-        return False, "Password must include a digit"
-    if rules.get("require_symbol", False) and not any(not c.isalnum() for c in password):
-        return False, "Password must include a symbol"
-    return True, "ok"
-
-
-def md5_b64(password: str) -> str:
-    return b64e(hashlib.md5(password.encode("utf-8")).digest())
-
-
-def pbkdf2_digest(password: str, salt: bytes, cost: int) -> bytes:
-    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, cost, dklen=32)
-
-
-def hash_password_record(password: str, cost: int = PBKDF2_COST) -> str:
-    salt = secrets.token_bytes(SALT_BYTES)
-    digest = pbkdf2_digest(password, salt, cost)
-    return f"{PBKDF2_ALGO}:{cost}:{b64e(salt)}:{b64e(digest)}"
-
-
-def verify_password_record(record: str, provided_password: str) -> bool:
-    parts = record.split(":")
-    if len(parts) == 1:
-        # Legacy format: base64(md5(password))
-        expected = parts[0]
-        got = md5_b64(provided_password)
-        return hmac.compare_digest(expected, got)
-    if len(parts) == 4 and parts[0] == PBKDF2_ALGO:
-        _, cost_s, salt_b64, digest_b64 = parts
-        cost = int(cost_s)
-        salt = b64d(salt_b64)
-        expected = b64d(digest_b64)
-        got = pbkdf2_digest(provided_password, salt, cost)
-        return hmac.compare_digest(expected, got)
-    return False
 
 
 def load_credentials() -> Dict[str, str]:
@@ -221,38 +93,6 @@ def save_credentials(creds: Dict[str, str]) -> None:
         for user in sorted(creds):
             f.write(f"{user}:{creds[user]}\n")
     secure_credentials_file_permissions()
-
-
-def anonymize_ip(ip_addr: str) -> str:
-    parts = ip_addr.split(".")
-    if len(parts) == 4 and all(p.isdigit() for p in parts):
-        return f"{parts[0]}.{parts[1]}.{parts[2]}.x"
-    if ":" in ip_addr:
-        chunks = [c for c in ip_addr.split(":") if c]
-        if len(chunks) >= 2:
-            return f"{chunks[0]}:{chunks[1]}:*"
-        return "ipv6:*"
-    return "unknown"
-
-
-def json_send(conn: socket.socket, payload: dict) -> None:
-    data = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8") + b"\n"
-    conn.sendall(data)
-
-
-def json_recv(buffer: bytearray, conn: socket.socket) -> Optional[dict]:
-    while True:
-        idx = buffer.find(b"\n")
-        if idx != -1:
-            line = bytes(buffer[:idx])
-            del buffer[: idx + 1]
-            if not line:
-                continue
-            return json.loads(line.decode("utf-8"))
-        chunk = conn.recv(BUFFER_SIZE)
-        if not chunk:
-            return None
-        buffer.extend(chunk)
 
 
 @dataclass
